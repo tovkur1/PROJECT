@@ -1,144 +1,72 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+# server.py
+from flask import Flask
+from flask_sqlalchemy import SQLAlchemy
 import requests
-import pandas as pd
 from datetime import datetime
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
-import logging
 
-# Настройка логгирования
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+app = Flask(__name__)
+app.config['SQLALCHEMY_DATABASE_URI'] = 'postgresql://username:password@localhost/ria_data'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+db = SQLAlchemy(app)
 
-# FastAPI приложение
-app = FastAPI()
-
-# Модель Pydantic для валидации
-class Event(BaseModel):
-    region: str
-    location: str
-    latitude: float
-    longitude: float
-    event_date: str
-    description: str
-
-# Подключение к PostgreSQL
-SQLALCHEMY_DATABASE_URL = "postgresql://postgres:yourpassword@localhost:5432/ria_events"
-engine = create_engine(SQLALCHEMY_DATABASE_URL)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-
-Base = declarative_base()
-
-# Модель SQLAlchemy
-class DBEvent(Base):
-    __tablename__ = "events"
+class RiaData(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    date = db.Column(db.DateTime, nullable=False)
+    title = db.Column(db.String(500), nullable=False)
+    description = db.Column(db.Text)
+    lat = db.Column(db.Float, nullable=False)
+    lon = db.Column(db.Float, nullable=False)
+    type = db.Column(db.String(100))
     
-    id = Column(Integer, primary_key=True, index=True)
-    region = Column(String)
-    location = Column(String)
-    latitude = Column(Float)
-    longitude = Column(Float)
-    event_date = Column(DateTime)
-    description = Column(String)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    def __repr__(self):
+        return f'<RiaData {self.title}>'
 
-# Создаем таблицы
-Base.metadata.create_all(bind=engine)
-
-# Функция для получения данных из API
 def fetch_ria_data():
     api_url = "https://cdndc.img.ria.ru/dc/kay-n/2022/SOP-content/data/points/data-24.04.2025.json?v=1196"
     
     headers = {
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
-        "Referer": "https://ria.ru/20220622/spetsoperatsiya-1795199102.html",
+        "Referer": "https://ria.ru/20220622/spetsoperatsiya-1795199102.html"
     }
-
+    
     try:
-        response = requests.get(api_url, headers=headers, timeout=10)
+        response = requests.get(api_url, headers=headers)
         response.raise_for_status()
         return response.json()
     except requests.exceptions.RequestException as e:
-        logger.error(f"Ошибка при запросе к API: {str(e)}")
-        raise HTTPException(status_code=500, detail="Ошибка при получении данных")
+        print(f"Error fetching data: {e}")
+        return None
 
-# Функция для сохранения в БД
-def save_to_db(events):
-    db = SessionLocal()
-    try:
-        for event in events:
-            db_event = DBEvent(
-                region=event['region'],
-                location=event['location'],
-                latitude=event['latitude'],
-                longitude=event['longitude'],
-                event_date=datetime.strptime(event['event_date'], "%Y-%m-%d") if event['event_date'] else None,
-                description=event['description']
-            )
-            db.add(db_event)
-        db.commit()
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Ошибка при сохранении в БД: {str(e)}")
-        raise HTTPException(status_code=500, detail="Ошибка при сохранении данных")
-    finally:
-        db.close()
-
-# Эндпоинт для загрузки и сохранения данных
-@app.post("/load-events/")
-async def load_events():
-    try:
-        # Получаем данные
-        raw_data = fetch_ria_data()
-        
-        # Обрабатываем данные
-        events = []
-        for item in raw_data:
-            # Извлекаем дату из URL
-            date_from_url = None
-            if 'link' in item:
-                try:
-                    date_str = item['link'].split('/')[3]
-                    date_from_url = datetime.strptime(date_str, "%Y%m%d").strftime("%Y-%m-%d")
-                except (IndexError, ValueError):
-                    pass
-            
-            events.append({
-                'region': item.get('area', 'Не указано'),
-                'location': item.get('fullName', 'Не указано'),
-                'latitude': item.get('lat'),
-                'longitude': item.get('lng'),
-                'event_date': date_from_url,
-                'description': item.get('text', '')[:500] + '...'
-            })
-        
-        # Сохраняем в БД
-        save_to_db(events)
-        
-        return {"message": f"Успешно сохранено {len(events)} событий"}
+@app.route('/parse-and-save')
+def parse_and_save():
+    data = fetch_ria_data()
+    if not data:
+        return "Failed to fetch data", 500
     
+    try:
+        for item in data:
+            # Преобразуем дату из строки в объект datetime
+            date_obj = datetime.strptime(item['date'], '%d.%m.%Y')
+            
+            # Создаем новую запись
+            new_entry = RiaData(
+                date=date_obj,
+                title=item['title'],
+                description=item.get('description', ''),
+                lat=float(item['lat']),
+                lon=float(item['lon']),
+                type=item.get('type', '')
+            )
+            
+            db.session.add(new_entry)
+        
+        db.session.commit()
+        return f"Successfully saved {len(data)} records", 200
     except Exception as e:
-        logger.error(f"Ошибка: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        db.session.rollback()
+        return f"Error saving data: {str(e)}", 500
 
-# Эндпоинт для получения событий
-@app.get("/events/", response_model=list[Event])
-async def get_events(limit: int = 100):
-    db = SessionLocal()
-    try:
-        events = db.query(DBEvent).order_by(DBEvent.event_date.desc()).limit(limit).all()
-        return events
-    finally:
-        db.close()
-
-# Эндпоинт для поиска по региону
-@app.get("/events/by-region/", response_model=list[Event])
-async def get_events_by_region(region: str):
-    db = SessionLocal()
-    try:
-        events = db.query(DBEvent).filter(DBEvent.region.ilike(f"%{region}%")).all()
-        return events
-    finally:
-        db.close()
+if __name__ == '__main__':
+    with app.app_context():
+        db.create_all()
+    app.run(debug=True)
